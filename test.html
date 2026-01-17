@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TXM | Secure Access Terminal</title>
+    <!-- Dependencies -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Playfair+Display:italic,wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        :root {
+            --bg-dark: #07090b;
+            --accent-blue: #2D5BFF;
+            --glass-border: rgba(255, 255, 255, 0.1);
+            --text-muted: #94a3b8;
+        }
+
+        body {
+            background-color: var(--bg-dark);
+            color: white;
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .font-serif { font-family: 'Playfair Display', serif; }
+
+        .glass-panel {
+            background: rgba(255, 255, 255, 0.02);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 16px;
+        }
+
+        .glass-card {
+            background: rgba(255, 255, 255, 0.02);
+            backdrop-filter: blur(25px);
+            border: 1px solid var(--glass-border);
+            border-radius: 32px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .input-field {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--glass-border);
+            color: white;
+            transition: all 0.3s ease;
+        }
+
+        .input-field:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 15px rgba(45, 91, 255, 0.2);
+            outline: none;
+        }
+
+        .nav-item {
+            position: relative;
+            color: var(--text-muted);
+            transition: color 0.3s;
+            cursor: pointer;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .nav-item:hover, .nav-item.active { color: white; }
+        .nav-item.active::after {
+            content: '';
+            position: absolute;
+            bottom: -24px;
+            left: 0;
+            width: 100%;
+            height: 2px;
+            background: var(--accent-blue);
+            box-shadow: 0 0 10px var(--accent-blue);
+        }
+
+        .toast {
+            position: fixed;
+            top: -100px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border-radius: 12px;
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            transition: all 0.5s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+        }
+        .toast.show { top: 40px; }
+        .toast-error { background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; }
+
+        #app-container { opacity: 0; }
+    </style>
+</head>
+<body>
+
+    <div id="error-toast" class="toast toast-error"></div>
+    <div id="app-container" class="min-h-screen"></div>
+
+    <script>
+        // --- State Management ---
+        let userData = null;
+        let sessionKey = null; // Stored only in JS memory, never localStorage
+        const appContainer = document.getElementById('app-container');
+
+        // Safety sync for refreshes
+        const syncSession = () => {
+            if (!userData) {
+                const saved = localStorage.getItem('txm_session');
+                if (saved) {
+                    userData = JSON.parse(saved);
+                    // Note: sessionKey will be lost on refresh unless re-entered
+                }
+            }
+            return userData;
+        };
+
+        const getAgentID = () => {
+            const user = syncSession();
+            if (user && user.email) return user.email.split('@')[0].toUpperCase();
+            return "GUEST_NODE";
+        };
+
+        // --- Cryptography Helpers ---
+
+        async function decryptLicense(encryptedBase64, password) {
+            try {
+                const enc = new TextEncoder();
+                const data = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+                
+                // Extract IV (first 12 bytes) and Ciphertext
+                const iv = data.slice(0, 12);
+                const ciphertext = data.slice(12);
+
+                // Derive Key from password
+                const keyMaterial = await crypto.subtle.importKey(
+                    "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]
+                );
+                
+                const key = await crypto.subtle.deriveKey(
+                    { 
+                        name: "PBKDF2", 
+                        salt: enc.encode("txm-salt-2024"), // Must match the backend salt
+                        iterations: 100000, 
+                        hash: "SHA-256" 
+                    },
+                    keyMaterial, 
+                    { name: "AES-GCM", length: 256 }, 
+                    false, 
+                    ["decrypt"]
+                );
+
+                const decrypted = await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: iv }, 
+                    key, 
+                    ciphertext
+                );
+
+                return new TextDecoder().decode(decrypted);
+            } catch (e) {
+                console.error("Decryption failed:", e);
+                return null;
+            }
+        }
+
+        // --- View Renderers ---
+
+        const renderLogin = () => {
+            appContainer.innerHTML = `
+                <div class="flex items-center justify-center min-h-screen">
+                    <div class="w-full max-w-md px-6">
+                        <div class="text-center mb-8">
+                            <div class="text-3xl font-bold tracking-tighter">TXM<span class="text-blue-500">.</span></div>
+                            <p class="text-[10px] uppercase tracking-[0.4em] text-slate-500">Secure Node Access</p>
+                        </div>
+                        <div class="glass-card p-10">
+                            <h2 class="text-2xl font-light text-center mb-8 tracking-tight">Intelligence Login</h2>
+                            <form id="login-form" onsubmit="handleLogin(event)" class="space-y-6">
+                                <input type="email" id="email" required placeholder="Email Address" class="input-field w-full px-5 py-4 rounded-xl text-sm">
+                                <input type="password" id="password" required placeholder="Access Key" class="input-field w-full px-5 py-4 rounded-xl text-sm">
+                                <button type="submit" id="submit-btn" class="bg-blue-600 hover:bg-blue-500 transition-all w-full py-4 rounded-xl font-bold uppercase tracking-widest text-xs">
+                                    Authenticate
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+            `;
+            gsap.to('#app-container', { opacity: 1, duration: 0.5 });
+        };
+
+        const renderNav = (activeView) => `
+            <nav class="border-b border-white/5 bg-[#07090b]/80 backdrop-blur-md sticky top-0 z-50">
+                <div class="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+                    <div class="flex items-center gap-12">
+                        <div class="text-2xl font-bold tracking-tighter cursor-pointer" onclick="renderDashboard()">TXM<span class="text-blue-500">.</span></div>
+                        <div class="hidden md:flex gap-8">
+                            <a onclick="renderDashboard()" class="nav-item ${activeView === 'dash' ? 'active' : ''}">Dashboard</a>
+                            <a onclick="renderLicenses()" class="nav-item ${activeView === 'license' ? 'active' : ''}">License</a>
+                            <a onclick="logout()" class="nav-item text-red-400">Logout</a>
+                        </div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-[10px] text-blue-500 font-bold uppercase tracking-wider">Status: Secure</div>
+                        <div class="text-xs text-slate-400 font-mono">ID: ${getAgentID()}</div>
+                    </div>
+                </div>
+            </nav>
+        `;
+
+        window.renderDashboard = () => {
+            syncSession();
+            appContainer.innerHTML = renderNav('dash') + `
+                <main class="max-w-7xl mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-3 gap-8 w-full">
+                    <div class="lg:col-span-1 space-y-6">
+                        <div class="glass-panel p-8">
+                            <h1 class="text-3xl font-light mb-2">Hello, <br><span class="font-serif italic text-blue-500">Authorized Agent.</span></h1>
+                        </div>
+                        <div class="glass-panel p-8">
+                            <h2 class="text-xs font-bold uppercase tracking-widest text-slate-500 mb-4">Intelligence Repository</h2>
+                            <a href="https://drive.google.com/drive/folders/1nvd6HSrAUrxobMaLqbnEGcc_NPMhbHQw?usp=sharing" target="_blank" 
+                               class="flex items-center justify-center gap-3 w-full py-4 bg-blue-600 hover:bg-blue-500 text-white text-[10px] font-bold uppercase tracking-[0.2em] transition-all rounded-xl">
+                                <i class="fa-solid fa-cloud-arrow-down"></i> Access Drive Files
+                            </a>
+                        </div>
+                    </div>
+                    <div class="lg:col-span-2">
+                        <div class="glass-panel p-6">
+                            <div id="tv-chart-container" class="h-[500px] bg-black rounded-lg border border-white/5 overflow-hidden"></div>
+                        </div>
+                    </div>
+                </main>
+            `;
+            loadTradingViewWidget('NASDAQ:NVDA');
+            gsap.to('#app-container', { opacity: 1, duration: 0.3 });
+        };
+
+        window.renderLicenses = async () => {
+            syncSession();
+            appContainer.innerHTML = renderNav('license') + `
+                <div class="p-20 text-center animate-pulse text-slate-500 tracking-widest text-xs uppercase">Decrypting Vault...</div>
+            `;
+            
+            // Safety check: If user refreshed, we don't have the sessionKey (password)
+            if (!sessionKey) {
+                appContainer.innerHTML = renderNav('license') + `
+                    <main class="max-w-7xl mx-auto px-6 py-24 text-center">
+                        <div class="glass-panel p-12 max-w-xl mx-auto border-yellow-500/20">
+                            <i class="fa-solid fa-clock-rotate-left text-yellow-500 text-2xl mb-4"></i>
+                            <p class="text-slate-400 mb-6">Session encryption key expired due to page refresh.</p>
+                            <button onclick="logout()" class="px-8 py-3 bg-white/5 border border-white/10 rounded-lg text-[10px] uppercase font-bold tracking-widest">Re-Authenticate</button>
+                        </div>
+                    </main>
+                `;
+                return;
+            }
+
+            try {
+                const res = await fetch('https://license-backend.fullynerfed.workers.dev/licenses');
+                const data = await res.json();
+                const encryptedEntry = data.find(l => l.email === userData.email);
+
+                if (encryptedEntry) {
+                    const clearText = await decryptLicense(encryptedEntry.license_key, sessionKey);
+                    
+                    appContainer.innerHTML = renderNav('license') + `
+                        <main class="max-w-7xl mx-auto px-6 py-24">
+                            <div class="glass-panel p-12 max-w-2xl mx-auto text-center border-blue-500/20">
+                                <h2 class="text-xs font-bold uppercase tracking-[0.3em] text-slate-500 mb-2">Personal License Key</h2>
+                                <div class="py-8 border-y border-white/5 my-8">
+                                    <div class="text-4xl font-mono font-bold tracking-[0.2em] text-white">
+                                        ${clearText || 'DECRYPTION_FAILED'}
+                                    </div>
+                                </div>
+                                <div class="flex justify-center items-center gap-2 text-green-500 text-[10px] font-bold uppercase tracking-widest">
+                                    <i class="fa-solid fa-lock-open"></i> Securely Decrypted locally
+                                </div>
+                            </div>
+                        </main>
+                    `;
+                } else {
+                    showToast("No license found for this agent.");
+                    renderDashboard();
+                }
+            } catch (err) {
+                showToast("Registry Access Denied");
+                renderDashboard();
+            }
+        };
+
+        // --- Core Logic ---
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const btn = document.getElementById('submit-btn');
+            
+            btn.disabled = true;
+            btn.innerText = 'VERIFYING...';
+
+            try {
+                const response = await fetch('https://txm.fullynerfed.workers.dev/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email, password })
+                });
+
+                const data = await response.json();
+
+                if (response.ok && data.success) {
+                    userData = { email, ...data };
+                    sessionKey = password; // Store for decryption later
+                    localStorage.setItem('txm_session', JSON.stringify(userData));
+                    gsap.to('#app-container', { opacity: 0, duration: 0.3, onComplete: renderDashboard });
+                } else {
+                    showToast(data.error || "Invalid Credentials");
+                    btn.disabled = false;
+                    btn.innerText = 'AUTHENTICATE';
+                }
+            } catch (err) {
+                showToast("Server Communication Error");
+                btn.disabled = false;
+                btn.innerText = 'AUTHENTICATE';
+            }
+        }
+
+        function loadTradingViewWidget(symbol) {
+            const container = document.getElementById('tv-chart-container');
+            if (!container) return;
+            container.innerHTML = '';
+            const script = document.createElement('script');
+            script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+            script.type = 'text/javascript'; script.async = true;
+            script.innerHTML = JSON.stringify({
+                "autosize": true, "symbol": symbol, "interval": "D", "theme": "dark",
+                "style": "1", "locale": "en", "enable_publishing": false,
+                "hide_top_toolbar": false, "container_id": "tv-chart-container",
+                "backgroundColor": "rgba(7, 9, 11, 1)", "gridColor": "rgba(255, 255, 255, 0.05)"
+            });
+            container.appendChild(script);
+        }
+
+        function showToast(msg) {
+            const t = document.getElementById('error-toast');
+            t.innerText = msg;
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 3000);
+        }
+
+        function logout() {
+            localStorage.removeItem('txm_session');
+            sessionKey = null;
+            location.reload();
+        }
+
+        window.onload = () => {
+            const saved = localStorage.getItem('txm_session');
+            if (saved) {
+                try {
+                    userData = JSON.parse(saved);
+                    renderDashboard();
+                } catch(e) { renderLogin(); }
+            } else {
+                renderLogin();
+            }
+        };
+    </script>
+</body>
+</html>
